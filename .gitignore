@@ -47,3 +47,9 @@ Thumbs.db
 desktop.ini
 .DS_Store
 *.log
+
+# AutoHotkey v1.1 binaries are GPL - do not redistribute. Install AutoHotkey v1.1 separately.
+ahk-v1/
+*.exe
+*.chm
+bot.pid
