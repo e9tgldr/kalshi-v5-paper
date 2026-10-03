@@ -1,0 +1,1059 @@
+; =====================================================================
+; KALSHI v5 PAPER TRADING - STANDALONE BUILD
+; Source: code.processoverprofit.blog  Video 14: Kalshi Bot v5
+;         (Paper-Trading Code tab)
+;
+; This build runs with plain AutoHotkey v1.1 (portable copy included
+; in ahk-v1\). It does NOT need the Nightshark app: the Nightshark
+; built-in functions the script expects (Log, LogStream, LogStreamRemove,
+; HttpGet, GetKalshiPrice, stopCode, RunCMD) are replaced by free local
+; shims at the bottom of this file.
+;
+; - No Kalshi account, no API keys, no signer: nothing is ever sent.
+; - Live data is read from Kalshi's PUBLIC market API.
+; - Your status lives in:  kalshi-paper.log   (event log)
+;                          kalshi-streams.txt (latest PnL/balance/prices)
+;
+; Stop the bot: tray icon -> Exit, or close via task manager
+;               (AutoHotkeyU64.exe), or run stop-paper.ps1
+; =====================================================================
+#NoEnv
+#SingleInstance force
+SetWorkingDir %A_ScriptDir%
+LogFile := A_ScriptDir . "\kalshi-paper.log"
+gLogStreamsFile := A_ScriptDir . "\kalshi-streams.txt"
+gLogStreams := {}
+FileDelete, %gLogStreamsFile%
+
+
+; ======================================
+; KALSHI v5 PAPER TRADING CONFIGURATION
+; ======================================
+initialBalance := 1000        ; paper trading starting balance (USD)
+timeDelay := 8                ; activation window in remaining minutes (max 15)
+EntryRange := [0.75, 0.85]    ; inclusive entry range: [Min, Max]
+Exit := 0.40                  ; legacy absolute stop (only used if StopLossPct = 0)
+TakeProfitPts := 0.10         ; legacy fixed take-profit points (only used if TakeProfitPct = 0)
+StopLossPct := 0.05           ; NEW: stop-loss = entry price * (1 - this)  e.g. 0.05 -> entry 0.80 stops at 0.76
+TakeProfitPct := 0.10         ; NEW: take-profit = entry price * (1 + this) e.g. 0.10 -> entry 0.80 targets 0.88
+Delta := 0                    ; min |open15m - live price| required alongside EntryRange
+assets := ["BTC"]             ; Options ["ETH"], ["SOL"], ["XRP"], ["DOGE"], ["HYPE"], ["BNB"]
+orderSize := 10               ; exact number of paper contracts per entry
+Pings := 1                    ; one-second stop-loss confirmation checks; 0 exits immediately
+
+;=================
+;DAILY TARGETS
+;=================
+Daily_Profit_Target := 400      ; stop after closed-trade PnL is greater than this; 0 disables
+Daily_Loss_Target := -600        ; stop after closed-trade PnL is less than this negative value; 0 disables
+
+; =============================================================
+; Kalshi Market Data Config (paper trading â€” no live orders)
+; DO NOT TOUCH BELOW VALUES UNLESS YOU KNOW WHAT YOU ARE DOING
+; =============================================================
+pollIntervalMs := 700
+pollJitterMaxMs := 250
+marketRefreshMs := 5000       ; refresh market/session metadata less often; orderbook still refreshes every loop
+priceRefreshMs := 1500        ; throttle live underlying-price calls used by LogStream
+kalshiApiBase := "https://api.elections.kalshi.com"
+assetSeriesMap := { "BTC": "KXBTC15M", "ETH": "KXETH15M", "SOL": "KXSOL15M", "XRP": "KXXRP15M", "DOGE": "KXDOGE15M", "HYPE": "KXHYPE15M", "BNB": "KXBNB15M" }
+
+settingsValid := true
+
+initialBalanceValid := IsNumericStr(initialBalance) && (initialBalance + 0) > 0
+if (!initialBalanceValid) {
+    Log("ERROR: initialBalance is '" initialBalance "'. It needs to be a number greater than zero, for example 1000.")
+    settingsValid := false
+}
+
+EntryMin := ""
+EntryMax := ""
+entryRangeShapeValid := (IsObject(EntryRange) && EntryRange.Length() = 2)
+if (!entryRangeShapeValid) {
+    Log("ERROR: EntryRange must be [Min, Max], for example [0.60, 0.70]. Both values need to be decimals between 0 and 1.")
+    settingsValid := false
+} else {
+    entryMinRaw := EntryRange[1]
+    entryMaxRaw := EntryRange[2]
+    entryMinValid := IsNumericStr(entryMinRaw) && (entryMinRaw + 0) > 0 && (entryMinRaw + 0) < 1
+    entryMaxValid := IsNumericStr(entryMaxRaw) && (entryMaxRaw + 0) > 0 && (entryMaxRaw + 0) < 1
+
+    if (!entryMinValid) {
+        Log("ERROR: EntryRange Min is '" entryMinRaw "'. It needs to be a decimal between 0 and 1, for example 0.60.")
+        settingsValid := false
+    } else {
+        EntryMin := entryMinRaw + 0
+    }
+    if (!entryMaxValid) {
+        Log("ERROR: EntryRange Max is '" entryMaxRaw "'. It needs to be a decimal between 0 and 1, for example 0.70.")
+        settingsValid := false
+    } else {
+        EntryMax := entryMaxRaw + 0
+    }
+    if (entryMinValid && entryMaxValid && EntryMin > EntryMax) {
+        Log("ERROR: EntryRange Min " EntryMin " is greater than Max " EntryMax ". Put the smaller decimal first, for example [0.60, 0.70].")
+        settingsValid := false
+    }
+}
+
+exitValid := IsNumericStr(Exit) && (Exit + 0) > 0 && (Exit + 0) < 1
+if (!exitValid) {
+    Log("ERROR: Exit is '" Exit "'. It needs to be a decimal between 0 and 1, for example 0.40.")
+    settingsValid := false
+}
+
+stopLossPctValid := IsNumericStr(StopLossPct) && (StopLossPct + 0) >= 0 && (StopLossPct + 0) < 1
+if (!stopLossPctValid) {
+    Log("ERROR: StopLossPct is '" StopLossPct "'. Use a decimal between 0 and 1 (0 = use legacy Exit), for example 0.05.")
+    settingsValid := false
+}
+
+takeProfitPctValid := IsNumericStr(TakeProfitPct) && (TakeProfitPct + 0) >= 0 && (TakeProfitPct + 0) <= 1
+if (!takeProfitPctValid) {
+    Log("ERROR: TakeProfitPct is '" TakeProfitPct "'. Use a decimal between 0 and 1 (0 = use legacy TakeProfitPts), for example 0.10.")
+    settingsValid := false
+}
+
+takeProfitPtsValid := IsNumericStr(TakeProfitPts) && (TakeProfitPts + 0) > 0 && (TakeProfitPts + 0) <= 1
+if (!takeProfitPtsValid) {
+    Log("ERROR: TakeProfitPts is '" TakeProfitPts "'. It needs to be greater than 0 and no more than 1, for example 0.10 or 1.")
+    settingsValid := false
+}
+
+timeDelayValid := IsNumericStr(timeDelay) && (timeDelay + 0) > 0 && (timeDelay + 0) <= 15
+if (!timeDelayValid) {
+    Log("ERROR: timeDelay is '" timeDelay "'. It needs to be greater than zero and no more than 15 minutes.")
+    settingsValid := false
+}
+
+orderSizeText := Trim(orderSize)
+orderSizeValid := RegExMatch(orderSizeText, "^\d+(\.\d{1,2})?$") && (orderSize + 0) > 0
+if (!orderSizeValid) {
+    Log("ERROR: orderSize is '" orderSize "'. Set it to a positive contract count with no more than two decimal places, for example 1 or 5.50.")
+    settingsValid := false
+}
+
+dailyProfitTargetValid := IsNumericStr(Daily_Profit_Target) && (Daily_Profit_Target + 0) >= 0
+if (!dailyProfitTargetValid) {
+    Log("ERROR: Daily_Profit_Target is '" Daily_Profit_Target "'. Use a positive dollar amount, or 0 to disable it.")
+    settingsValid := false
+}
+
+dailyLossTargetValid := IsNumericStr(Daily_Loss_Target) && (Daily_Loss_Target + 0) <= 0
+if (!dailyLossTargetValid) {
+    Log("ERROR: Daily_Loss_Target is '" Daily_Loss_Target "'. Use a negative dollar amount, or 0 to disable it.")
+    settingsValid := false
+}
+
+pingsText := Trim(Pings)
+pingsValid := RegExMatch(pingsText, "^\d+$")
+if (!pingsValid) {
+    Log("ERROR: Pings is '" Pings "'. Use a whole number of confirmation checks, for example 0, 1, or 2.")
+    settingsValid := false
+}
+
+if (!settingsValid) {
+    Log("ERROR: Fix the settings listed above and restart the script. Stopping now.")
+    stopCode()
+    return
+}
+if ((TakeProfitPts + 0) = 1)
+    Log("TakeProfitPts = 1, winners will be held to resolution")
+
+; Strategy state.
+positions := {}
+assetPhase := {}                    ; WAIT_WINDOW | MONITORING | IN_POSITION | STOPPED_OUT | TOOK_PROFIT
+assetSessionQuarter := {}
+assetLastPriceLogTick := {}
+assetSnapshotCache := {}
+assetMarketRefreshTick := {}
+assetPriceCache := {}
+assetPriceRefreshTick := {}
+assetMarketLogStreamVisible := {}
+paperSettlementLastCheckTick := {}
+pendingPaperSettlements := {}
+
+; Paper account state.
+paperBalance := initialBalance + 0
+paperWins := 0
+paperLosses := 0
+paperGrossProfit := 0
+paperGrossLoss := 0
+paperTradeCount := 0
+
+Log("Kalshi PAPER TRADING Started | EntryRange: [" EntryMin ", " EntryMax "] | Contracts: " PaperFormatSize(orderSize) " | Exit: " Exit " | TakeProfitPts: " TakeProfitPts " | Pings: " Pings " | Daily targets: " Daily_Profit_Target "/" Daily_Loss_Target " | Delta: " Delta " | Window: last " timeDelay "m | InitialBalance: " Fmt2(initialBalance))
+UpdatePaperAccountLogStream()
+
+loop {
+    for _, asset in assets {
+        snapshot := GetKalshiMarketSnapshot(asset)
+        if !IsObject(snapshot) {
+            HideKalshiMarketLogStream(asset)
+            if (PositionSessionEnded(asset))
+                MarkHeldToResolution(asset)
+            noDataKey := asset "|NO_DATA_" CurrentQuarterIndex()
+            if !IsObject(logOnceKeys)
+                logOnceKeys := {}
+            if !logOnceKeys.HasKey(noDataKey) {
+                logOnceKeys[noDataKey] := true
+                Log(asset " Waiting for Kalshi market data")
+            }
+            continue
+        }
+
+        up := snapshot.up
+        down := snapshot.down
+        minsLeft := SnapshotMinutesLeft(snapshot)
+        if (minsLeft = "")
+            minsLeft := MinutesRemainingInQuarter()
+        inEntryWindow := (minsLeft > 0 && minsLeft <= timeDelay)
+        sessionKey := (snapshot.marketTicker != "") ? snapshot.marketTicker : ((snapshot.closeTime != "") ? snapshot.closeTime : CurrentQuarterIndex())
+
+        if (PositionSessionEnded(asset, snapshot)) {
+            HideKalshiMarketLogStream(asset)
+            MarkHeldToResolution(asset)
+            continue
+        }
+
+        if (!assetSessionQuarter.HasKey(asset) || assetSessionQuarter[asset] != sessionKey) {
+            HideKalshiMarketLogStream(asset)
+            assetSessionQuarter[asset] := sessionKey
+            assetPhase[asset] := "WAIT_WINDOW"
+            assetLastPriceLogTick[asset] := 0
+            LogOnceReset(asset)
+            Log(asset " New Kalshi paper session (" snapshot.marketTicker ")")
+            continue
+        }
+
+        if IsObject(positions[asset]) {
+            pos := positions[asset]
+            current := (pos.side = "UP") ? up : down
+            positions[asset].lastMark := current + 0
+            assetPhase[asset] := "IN_POSITION"
+            UpdateKalshiLogStream(asset, snapshot)
+
+            exitReason := ""
+            exitPhase := ""
+            exitWaitMessage := ""
+            takeProfitTarget := pos.HasKey("takeProfitTarget") ? pos.takeProfitTarget + 0 : (pos.entry + TakeProfitPts)
+            stopLossPrice := (StopLossPct + 0 > 0) ? (pos.entry * (1 - StopLossPct)) : Exit
+            if (current < stopLossPrice) {
+                confirmedStopPrice := current
+                if (ConfirmKalshiPaperStopLoss(asset, pos, confirmedStopPrice)) {
+                    current := confirmedStopPrice
+                    exitReason := "exit_stop_" Fmt(stopLossPrice)
+                    exitPhase := "STOPPED_OUT"
+                    exitWaitMessage := asset " Stopped out, waiting for next session"
+                    Log(asset " Stop-loss confirmed @ " Fmt(current) " < " Fmt(stopLossPrice) " (entry " Fmt(pos.entry) " -" Fmt(StopLossPct * 100) "%)")
+                }
+            } else if (takeProfitTarget <= 1 && current >= takeProfitTarget) {
+                exitReason := "take_profit_at_" takeProfitTarget
+                exitPhase := "TOOK_PROFIT"
+                exitWaitMessage := asset " Take profit completed, waiting for next session"
+                Log(asset " Take-profit triggered @ " Fmt(current) " >= " Fmt(takeProfitTarget) " (fill " Fmt(pos.entry) " + " Fmt(TakeProfitPts) ")")
+            }
+
+            if (exitReason != "") {
+                RecordPaperTrade(asset, pos.side, pos.entry, current, pos.size, exitReason)
+                Log(asset " Paper position closed")
+                positions.Delete(asset)
+                assetPhase[asset] := exitPhase
+                HideKalshiMarketLogStream(asset)
+                LogOnce(asset, exitPhase, exitWaitMessage)
+                CheckPaperDailyPnlTargets()
+            }
+            continue
+        }
+
+        if (assetPhase[asset] = "STOPPED_OUT") {
+            HideKalshiMarketLogStream(asset)
+            LogOnce(asset, "STOPPED_OUT", asset " Stopped out, waiting for next session")
+            continue
+        }
+
+        if (assetPhase[asset] = "TOOK_PROFIT") {
+            HideKalshiMarketLogStream(asset)
+            LogOnce(asset, "TOOK_PROFIT", asset " Take profit completed, waiting for next session")
+            continue
+        }
+
+        if (assetPhase[asset] = "BUY_FAILED") {
+            HideKalshiMarketLogStream(asset)
+            LogOnce(asset, "BUY_FAILED", asset " Paper buy failed earlier, waiting for next session")
+            continue
+        }
+
+        if (!inEntryWindow) {
+            HideKalshiMarketLogStream(asset)
+            if (minsLeft <= 0)
+                LogOnce(asset, "SESSION_ENDED", asset " End of session, waiting for new Kalshi market")
+            else
+                LogOnce(asset, "WAIT_WINDOW", asset " Waiting for last " timeDelay " minutes")
+            assetPhase[asset] := "WAIT_WINDOW"
+            continue
+        }
+
+        if (!assetPhase.HasKey(asset) || assetPhase[asset] != "MONITORING") {
+            assetPhase[asset] := "MONITORING"
+            Log(asset " Monitoring Kalshi paper entry range [" Fmt(EntryMin) ", " Fmt(EntryMax) "] | Delta >= " Delta)
+        }
+
+        LiveDelta := UpdateKalshiLogStream(asset, snapshot)
+
+        side := ""
+        entryPrice := ""
+        upInEntryRange := (up >= EntryMin && up <= EntryMax)
+        downInEntryRange := (down >= EntryMin && down <= EntryMax)
+        if (upInEntryRange || downInEntryRange) {
+            if (LiveDelta != "" && LiveDelta >= Delta) {
+                if (upInEntryRange && (!downInEntryRange || up >= down)) {
+                    side := "UP"
+                    entryPrice := up
+                } else {
+                    side := "DOWN"
+                    entryPrice := down
+                }
+            } else {
+                LogOnce(asset, "DELTA_LOW", asset " LiveDelta " FmtOrNA(LiveDelta) " < Delta " Delta ", skipping entry")
+            }
+        } else {
+            LogOnce(asset, "PRICE_OUT_OF_RANGE", asset " UP " Fmt(up) " / DOWN " Fmt(down) " outside entry range [" Fmt(EntryMin) ", " Fmt(EntryMax) "]")
+        }
+
+        if (side = "")
+            continue
+
+        Log(asset " " side " triggered @ " Fmt(entryPrice) " â€” placing paper order")
+        if (!PaperBuyPosition(asset, side, entryPrice)) {
+            assetPhase[asset] := "BUY_FAILED"
+            HideKalshiMarketLogStream(asset)
+            LogOnce(asset, "BUY_FAILED", asset " Paper buy failed, waiting for next session")
+            continue
+        }
+
+        fillPrice := entryPrice + 0
+        if (TakeProfitPct + 0 > 0)
+            takeProfitTarget := Floor(fillPrice * (1 + TakeProfitPct) * 100) / 100
+        else
+            takeProfitTarget := fillPrice + (TakeProfitPts + 0)
+        positions[asset] := { side: side, entry: fillPrice, takeProfitTarget: takeProfitTarget, ticker: snapshot.marketTicker, sessionKey: sessionKey, quarterIndex: CurrentQuarterIndex(), size: orderSize + 0, lastMark: fillPrice }
+        assetPhase[asset] := "IN_POSITION"
+        assetLastPriceLogTick[asset] := 0
+        Log(asset " Paper position confirmed | fill: " Fmt(fillPrice) " | size: " PaperFormatSize(orderSize))
+        if (takeProfitTarget > 1)
+            Log(asset " TP target " Fmt(takeProfitTarget) " > 1; no TP exit—hold for resolution")
+        else {
+            stopLossPrice := (StopLossPct + 0 > 0) ? (fillPrice * (1 - StopLossPct)) : Exit
+            Log(asset " Monitoring stop-loss < " Fmt(stopLossPrice) " | take-profit >= " Fmt(takeProfitTarget) " | risk " Fmt(fillPrice - stopLossPrice) " vs reward " Fmt(takeProfitTarget - fillPrice) " per contract")
+        }
+    }
+
+    ProcessPendingPaperSettlements()
+    UpdatePaperAccountLogStream()
+    Random, pollJitterMs, 0, %pollJitterMaxMs%
+    sleepMs := pollIntervalMs + pollJitterMs
+    if (sleepMs > 0)
+        Sleep %sleepMs%
+}
+
+
+LogOnce(asset, reason, msg) {
+    global logOnceKeys
+    if !IsObject(logOnceKeys)
+        logOnceKeys := {}
+    key := asset "|" reason
+    if (logOnceKeys.HasKey(key))
+        return
+    logOnceKeys[key] := true
+    Log(msg)
+}
+
+LogOnceReset(asset) {
+    global logOnceKeys
+    if !IsObject(logOnceKeys)
+        return
+    toRemove := []
+    for k, _ in logOnceKeys {
+        if (InStr(k, asset "|") = 1)
+            toRemove.Push(k)
+    }
+    for _, k in toRemove
+        logOnceKeys.Delete(k)
+}
+
+PositionSessionEnded(asset, snapshot := "") {
+    global positions
+    if !IsObject(positions[asset])
+        return false
+
+    pos := positions[asset]
+    if (IsObject(snapshot) && snapshot.marketTicker != "" && pos.HasKey("ticker") && pos.ticker != "" && snapshot.marketTicker != pos.ticker)
+        return true
+    if (pos.HasKey("quarterIndex") && CurrentQuarterIndex() != pos.quarterIndex)
+        return true
+    return false
+}
+
+MarkHeldToResolution(asset) {
+    global positions, assetPhase, pendingPaperSettlements
+    if !IsObject(positions[asset])
+        return true
+
+    pos := positions[asset]
+    pos.asset := asset
+    settlementKey := (pos.HasKey("ticker") && pos.ticker != "") ? pos.ticker : asset "|" A_TickCount
+    pendingPaperSettlements[settlementKey] := pos
+    Log(asset " " pos.side " held to resolution | settlement pending")
+    positions.Delete(asset)
+    ClearKalshiMarketCache(asset)
+    assetPhase[asset] := "WAIT_WINDOW"
+    return true
+}
+
+ProcessPendingPaperSettlements() {
+    global pendingPaperSettlements
+    if !IsObject(pendingPaperSettlements)
+        return
+
+    resolvedKeys := []
+    for settlementKey, pos in pendingPaperSettlements {
+        if !IsObject(pos)
+            continue
+        settlePrice := GetKalshiPaperSettlementPrice(settlementKey, pos)
+        if (settlePrice = "")
+            continue
+
+        asset := pos.HasKey("asset") ? pos.asset : "Kalshi"
+        lastMark := pos.HasKey("lastMark") ? pos.lastMark + 0 : pos.entry + 0
+        Log(asset " " pos.side " settlement confirmed @ " Fmt(settlePrice) " (last price " Fmt(lastMark) ")")
+        RecordPaperTrade(asset, pos.side, pos.entry, settlePrice, pos.size, "held_to_resolution")
+        resolvedKeys.Push(settlementKey)
+    }
+
+    for _, settlementKey in resolvedKeys
+        pendingPaperSettlements.Delete(settlementKey)
+    if (resolvedKeys.Length() > 0)
+        CheckPaperDailyPnlTargets()
+}
+
+ConfirmKalshiPaperStopLoss(asset, pos, ByRef confirmedPrice) {
+    global Pings, Exit, StopLossPct, positions
+    pingCount := Floor(Pings + 0)
+    if (pingCount <= 0)
+        return true
+
+    Log(asset " Stop-loss candidate @ " Fmt(confirmedPrice) " | waiting for " pingCount " confirmation ping(s)")
+    Loop, %pingCount% {
+        Sleep 1000
+        freshSnapshot := GetKalshiMarketSnapshot(asset)
+        if (!IsObject(freshSnapshot) || (pos.HasKey("ticker") && freshSnapshot.marketTicker != pos.ticker)) {
+            Log(asset " Stop-loss confirmation reset: fresh market price unavailable")
+            return false
+        }
+
+        pingPrice := (pos.side = "UP") ? freshSnapshot.up : freshSnapshot.down
+        if (pingPrice = "") {
+            Log(asset " Stop-loss confirmation reset: fresh side price unavailable")
+            return false
+        }
+        positions[asset].lastMark := pingPrice + 0
+        confirmedPrice := pingPrice + 0
+        stopRef := (StopLossPct + 0 > 0) ? (pos.entry * (1 - StopLossPct)) : Exit
+        if (confirmedPrice >= stopRef) {
+            Log("PING " A_Index " : " asset " Stop-loss reset: price rebounded to " Fmt(confirmedPrice))
+            return false
+        }
+        Log("PING " A_Index " : " asset " Stop-loss still below " Fmt(stopRef) " @ " Fmt(confirmedPrice))
+    }
+    return true
+}
+
+PaperHasOpenExposure() {
+    global positions, pendingPaperSettlements
+    for _, pos in positions {
+        if IsObject(pos)
+            return true
+    }
+    for _, pos in pendingPaperSettlements {
+        if IsObject(pos)
+            return true
+    }
+    return false
+}
+
+CheckPaperDailyPnlTargets() {
+    global Daily_Profit_Target, Daily_Loss_Target
+    if (PaperHasOpenExposure())
+        return false
+
+    pnl := ComputePaperLivePnl()
+    UpdatePaperAccountLogStream()
+    if ((Daily_Profit_Target + 0) > 0 && pnl > (Daily_Profit_Target + 0)) {
+        Log("Daily profit target reached | PnL " FmtPnl(pnl) " > " FmtPnl(Daily_Profit_Target) " | stopping bot")
+        stopCode()
+        return true
+    }
+    if ((Daily_Loss_Target + 0) < 0 && pnl < (Daily_Loss_Target + 0)) {
+        Log("Daily loss target reached | PnL " FmtPnl(pnl) " < " FmtPnl(Daily_Loss_Target) " | stopping bot")
+        stopCode()
+        return true
+    }
+    return false
+}
+
+GetKalshiPaperSettlementPrice(settlementKey, pos) {
+    global kalshiApiBase, paperSettlementLastCheckTick
+    if !IsObject(pos) || !pos.HasKey("ticker") || pos.ticker = ""
+        return ""
+
+    nowTick := A_TickCount
+    if (paperSettlementLastCheckTick.HasKey(settlementKey) && (nowTick - paperSettlementLastCheckTick[settlementKey]) < 2000)
+        return ""
+    paperSettlementLastCheckTick[settlementKey] := nowTick
+
+    url := kalshiApiBase "/trade-api/v2/markets/" pos.ticker "?_=" nowTick
+    body := HttpGet(url)
+    if (body = "")
+        return ""
+
+    result := JsonField(body, "result")
+    StringLower, result, result
+    if (result = "yes")
+        yesSettle := 1
+    else if (result = "no")
+        yesSettle := 0
+    else
+        return ""
+
+    paperSettlementLastCheckTick.Delete(settlementKey)
+    return (pos.side = "UP") ? yesSettle : 1 - yesSettle
+}
+
+UpdateKalshiLogStream(asset, snapshot) {
+    if !IsObject(snapshot)
+        return ""
+
+    priceObj := GetCachedKalshiPriceObj(asset)
+    livePrice := (IsObject(priceObj) && priceObj.HasKey("price") && priceObj.price > 0) ? priceObj.price : ""
+    openPrice := (IsObject(priceObj) && priceObj.HasKey("open15m") && priceObj.open15m > 0) ? priceObj.open15m : ""
+    LiveDelta := ""
+    if (livePrice != "" && openPrice != "")
+        LiveDelta := Abs(openPrice - livePrice)
+    LogMonitoringStream(asset, snapshot, livePrice, openPrice, LiveDelta)
+    return LiveDelta
+}
+
+LogMonitoringStream(asset, snapshot, livePrice := "", openPrice := "", LiveDelta := "") {
+    global assetMarketLogStreamVisible
+    if !IsObject(snapshot)
+        return
+    if (livePrice != "")
+        LogStream(asset, FmtOrNA(livePrice))
+    else
+        LogStream(asset, "n/a")
+    LogStream("OPEN PRICE", FmtOrNA(openPrice))
+    LogStream("up", FmtOrNA(snapshot.up))
+    LogStream("down", FmtOrNA(snapshot.down))
+    LogStream("LIVE DELTA", FmtLiveDeltaOrNA(LiveDelta))
+    assetMarketLogStreamVisible[asset] := true
+}
+
+UpdatePaperAccountLogStream() {
+    global paperWins, paperLosses, paperGrossProfit, paperGrossLoss, paperTradeCount
+    LogStream("LIVE PNL", FmtPnl(ComputePaperLivePnl()))
+    LogStream("BALANCE", Fmt2(ComputePaperEquity()))
+    LogStream("WINS", paperWins "/" paperTradeCount)
+    LogStream("AVG PROFIT", (paperWins > 0) ? Fmt2(paperGrossProfit / paperWins) : "n/a")
+    LogStream("AVG LOSS", (paperLosses > 0) ? Fmt2(paperGrossLoss / paperLosses) : "n/a")
+}
+
+HideKalshiMarketLogStream(asset) {
+    global assetMarketLogStreamVisible
+    if (!assetMarketLogStreamVisible.HasKey(asset) || !assetMarketLogStreamVisible[asset])
+        return
+
+    LogStreamRemove(asset)
+    LogStreamRemove("OPEN PRICE")
+    LogStreamRemove("up")
+    LogStreamRemove("down")
+    LogStreamRemove("LIVE DELTA")
+    assetMarketLogStreamVisible[asset] := false
+}
+
+GetCachedKalshiPriceObj(asset) {
+    global assetPriceCache, assetPriceRefreshTick, priceRefreshMs
+    nowTick := A_TickCount
+
+    if (assetPriceCache.HasKey(asset) && assetPriceRefreshTick.HasKey(asset)) {
+        if ((nowTick - assetPriceRefreshTick[asset]) < priceRefreshMs)
+            return assetPriceCache[asset]
+    }
+
+    priceObj := GetKalshiPrice(asset)
+    assetPriceRefreshTick[asset] := nowTick
+    if (IsObject(priceObj) && priceObj.HasKey("price") && priceObj.price > 0) {
+        assetPriceCache[asset] := priceObj
+        return priceObj
+    }
+
+    if (assetPriceCache.HasKey(asset))
+        return assetPriceCache[asset]
+    return ""
+}
+
+GetCachedKalshiAssetPrice(asset) {
+    obj := GetCachedKalshiPriceObj(asset)
+    if (IsObject(obj) && obj.HasKey("price"))
+        return obj.price
+    return ""
+}
+
+FmtOrNA(price) {
+    if (price = "")
+        return "n/a"
+    return Fmt(price)
+}
+
+FmtLiveDeltaOrNA(value) {
+    if (value = "")
+        return "n/a"
+
+    value := value + 0
+    if (Abs(value) >= 1)
+        return Round(value, 2)
+    return Round(value, 4)
+}
+
+Fmt(price) {
+    return Round(price + 0, 2)
+}
+
+Fmt2(value) {
+    return Format("{:.2f}", value + 0)
+}
+
+FmtPnl(value) {
+    if (value = "")
+        return "n/a"
+    value := Round(value + 0, 2)
+    if (value > 0)
+        return "+" Format("{:.2f}", value)
+    return Format("{:.2f}", value)
+}
+
+PaperFormatSize(size) {
+    value := Round((size + 0) * 100) / 100.0
+    text := Format("{:.2f}", value)
+    while (InStr(text, ".") && SubStr(text, StrLen(text), 1) = "0")
+        text := SubStr(text, 1, StrLen(text) - 1)
+    if (SubStr(text, StrLen(text), 1) = ".")
+        text := SubStr(text, 1, StrLen(text) - 1)
+    return text
+}
+
+PaperBuyPosition(asset, side, price) {
+    global paperBalance, orderSize
+    cost := (price + 0) * (orderSize + 0)
+    if (cost > paperBalance) {
+        Log(asset " Paper buy rejected: cost " Fmt2(cost) " exceeds cash balance " Fmt2(paperBalance))
+        Log("Not enough paper balance left to place trades. Stopping script.")
+        stopCode()
+        return false
+    }
+
+    paperBalance -= cost
+    Log(asset " Paper " side " filled @ " Fmt(price) " | size " PaperFormatSize(orderSize) " | cost " Fmt2(cost) " | cash " Fmt2(paperBalance))
+    return true
+}
+
+RecordPaperTrade(asset, side, entryPrice, exitPrice, size, reason) {
+    global paperBalance, paperWins, paperLosses, paperGrossProfit, paperGrossLoss, paperTradeCount
+    proceeds := (exitPrice + 0) * (size + 0)
+    pnl := ((exitPrice + 0) - (entryPrice + 0)) * (size + 0)
+    paperBalance += proceeds
+    paperTradeCount++
+
+    if (pnl > 0) {
+        paperWins++
+        paperGrossProfit += pnl
+    } else {
+        paperLosses++
+        paperGrossLoss += Abs(pnl)
+    }
+
+    Log(asset " Paper " side " closed @ " Fmt(exitPrice) " | entry " Fmt(entryPrice) " | size " PaperFormatSize(size) " | PnL " FmtPnl(pnl) " | cash " Fmt2(paperBalance) " | " reason)
+}
+
+ComputePaperEquity() {
+    global paperBalance, positions, pendingPaperSettlements
+    equity := paperBalance + 0
+    for _, pos in positions {
+        if !IsObject(pos)
+            continue
+        mark := pos.HasKey("lastMark") ? pos.lastMark + 0 : pos.entry + 0
+        equity += mark * (pos.size + 0)
+    }
+    for _, pos in pendingPaperSettlements {
+        if !IsObject(pos)
+            continue
+        mark := pos.HasKey("lastMark") ? pos.lastMark + 0 : pos.entry + 0
+        equity += mark * (pos.size + 0)
+    }
+    return equity
+}
+
+ComputePaperLivePnl() {
+    global initialBalance
+    return ComputePaperEquity() - (initialBalance + 0)
+}
+
+CurrentUtcNowAhk() {
+    nowUtc := A_NowUTC
+    if (nowUtc != "")
+        return nowUtc
+
+    out := Trim(RunAndCapture("powershell -NoProfile -Command ""[DateTime]::UtcNow.ToString('yyyyMMddHHmmss')"""))
+    if RegExMatch(out, "^\d{14}$")
+        return out
+    return ""
+}
+
+RunAndCapture(command) {
+    return RunCMD(command, A_ScriptDir)
+}
+
+
+MinutesRemainingInQuarter() {
+    utc := CurrentUtcNowAhk()
+    if (utc = "") {
+        ; Fallback to local clock if UTC unavailable
+        currentMinute := A_Min + 0
+        remaining := 15 - Mod(currentMinute, 15)
+        remaining := remaining - ((A_Sec + 0) / 60.0)
+        return remaining
+    }
+    mm := SubStr(utc, 11, 2) + 0
+    ss := SubStr(utc, 13, 2) + 0
+    remaining := 15 - Mod(mm, 15) - (ss / 60.0)
+    return remaining
+}
+
+IsXMinRemaining(x) {
+    return (MinutesRemainingInQuarter() <= x)
+}
+
+CurrentQuarterIndex() {
+    utc := CurrentUtcNowAhk()
+    if (utc = "") {
+        totalMinutes := (A_Hour + 0) * 60 + (A_Min + 0)
+        return Floor(totalMinutes / 15)
+    }
+    hh := SubStr(utc, 9, 2) + 0
+    mm := SubStr(utc, 11, 2) + 0
+    totalMinutes := hh * 60 + mm
+    return Floor(totalMinutes / 15)
+}
+
+SnapshotMinutesLeft(snapshot) {
+    if !IsObject(snapshot)
+        return ""
+
+    if (snapshot.HasKey("closeTime") && snapshot.closeTime != "") {
+        minsLeft := MinutesUntilIsoUtc(snapshot.closeTime)
+        if (minsLeft != "")
+            return minsLeft
+    }
+
+    if (snapshot.HasKey("minutesLeft"))
+        return snapshot.minutesLeft
+    return ""
+}
+
+IsSnapshotExpired(snapshot, cutoffMinutes := 0) {
+    minsLeft := SnapshotMinutesLeft(snapshot)
+    return (minsLeft != "" && minsLeft <= cutoffMinutes)
+}
+
+ClearKalshiMarketCache(asset) {
+    global assetSnapshotCache, assetMarketRefreshTick
+    if (assetSnapshotCache.HasKey(asset))
+        assetSnapshotCache.Delete(asset)
+    if (assetMarketRefreshTick.HasKey(asset))
+        assetMarketRefreshTick.Delete(asset)
+}
+
+GetKalshiMarketSnapshot(asset, maxRetries := 4) {
+    global assetSeriesMap, assetSnapshotCache, assetMarketRefreshTick, marketRefreshMs
+    if !assetSeriesMap.HasKey(asset)
+        return false
+    series := assetSeriesMap[asset]
+    nowTick := A_TickCount
+
+    if (assetSnapshotCache.HasKey(asset) && assetMarketRefreshTick.HasKey(asset)) {
+        cached := assetSnapshotCache[asset]
+        if (IsObject(cached) && (nowTick - assetMarketRefreshTick[asset]) < marketRefreshMs) {
+            if (IsSnapshotExpired(cached, 0.5)) {
+                ClearKalshiMarketCache(asset)
+            } else {
+                if (RefreshKalshiBestAsks(cached))
+                    return cached
+                return false
+            }
+        }
+    }
+
+    attempt := 1
+    while (attempt <= maxRetries) {
+        url := "https://api.elections.kalshi.com/trade-api/v2/markets?series_ticker=" series "&status=open&limit=1&_=" A_TickCount "-" attempt
+        body := HttpGet(url)
+
+        if (body != "") {
+            marketTicker := GetFirstNonEmptyJsonField(body, ["ticker"])
+            yesPrice := GetKalshiDollarPrice(body, "yes_ask_dollars", "yes_ask")
+            noPrice  := GetKalshiDollarPrice(body, "no_ask_dollars", "no_ask")
+
+            closeIso := GetFirstNonEmptyJsonField(body, ["close_time", "expected_expiration_time", "expiration_time", "settlement_time"])
+            minsLeft := MinutesUntilIsoUtc(closeIso)
+
+            ; Skip markets that already closed or close in < 30 seconds (stale/expired)
+            if (minsLeft != "" && minsLeft < 0.5) {
+                if (attempt < maxRetries) {
+                    Sleep 200
+                    attempt++
+                    continue
+                }
+            }
+
+            if (marketTicker != "") {
+                obj := {}
+                obj.up := (yesPrice != "") ? yesPrice + 0 : ""
+                obj.down := (noPrice != "") ? noPrice + 0 : ""
+                obj.minutesLeft := minsLeft
+                obj.closeTime := closeIso
+                obj.marketTicker := marketTicker
+                assetSnapshotCache[asset] := obj
+                assetMarketRefreshTick[asset] := nowTick
+                if (RefreshKalshiBestAsks(obj) || (obj.up != "" && obj.down != ""))
+                    return obj
+            }
+        }
+
+        if (attempt < maxRetries)
+            Sleep 200
+        attempt++
+    }
+
+    if (assetSnapshotCache.HasKey(asset)) {
+        cached := assetSnapshotCache[asset]
+        if IsObject(cached) {
+            if (IsSnapshotExpired(cached, 0.5)) {
+                ClearKalshiMarketCache(asset)
+                return false
+            }
+            if (RefreshKalshiBestAsks(cached))
+                return cached
+        }
+    }
+    return false
+}
+
+RefreshKalshiBestAsks(snapshot) {
+    if !IsObject(snapshot) || snapshot.marketTicker = ""
+        return false
+
+    url := "https://api.elections.kalshi.com/trade-api/v2/markets/" snapshot.marketTicker "/orderbook?depth=1&_=" A_TickCount
+    body := HttpGet(url)
+    if (body = "")
+        return false
+
+    yesBid := GetOrderbookBestBid(body, "yes_dollars")
+    noBid := GetOrderbookBestBid(body, "no_dollars")
+    updated := false
+
+    if (noBid != "") {
+        snapshot.up := Round(1 - (noBid + 0), 4)
+        updated := true
+    }
+    if (yesBid != "") {
+        snapshot.down := Round(1 - (yesBid + 0), 4)
+        updated := true
+    }
+
+    return updated
+}
+
+GetOrderbookBestBid(json, sideField) {
+    pattern := """" sideField """\s*:\s*\[\s*\[\s*""?(-?\d+(?:\.\d+)?)"
+    if RegExMatch(json, pattern, m)
+        return m1
+    return ""
+}
+
+GetKalshiDollarPrice(json, dollarField, centsField := "") {
+    val := GetFirstNonEmptyJsonField(json, [dollarField])
+    if (val != "")
+        return val
+
+    if (centsField != "") {
+        val := GetFirstNonEmptyJsonField(json, [centsField])
+        if (val != "" && IsNumericStr(val))
+            return (val + 0) / 100.0
+    }
+
+    return ""
+}
+
+GetFirstNonEmptyJsonField(json, fields, skipZero := false) {
+    for _, field in fields {
+        val := JsonField(json, field)
+        if (val != "") {
+            if (skipZero && IsNumericStr(val) && (val + 0) = 0)
+                continue
+            return val
+        }
+    }
+    return ""
+}
+
+IsNumericStr(s) {
+    s := Trim(s)
+    return RegExMatch(s, "^-?\d+(\.\d+)?$")
+}
+
+JsonField(json, field) {
+    pattern := """" field """\s*:\s*(""([^""]*)""|[^,}\s][^,}\r\n]*)"
+    result := ""
+    pos := 1
+    while (pos := RegExMatch(json, pattern, m, pos)) {
+        val := Trim(m1)
+        val := Trim(val, """")
+        if (val != "")
+            result := val
+        pos += StrLen(m)
+    }
+    return result
+}
+
+MinutesUntilIsoUtc(iso) {
+    ts := IsoUtcToAhk(iso)
+    if (ts = "")
+        return ""
+
+    nowUtc := CurrentUtcNowAhk()
+    if (nowUtc = "")
+        return ""
+
+    diff := ts
+    EnvSub, diff, %nowUtc%, Seconds
+    return diff / 60.0
+}
+
+IsoUtcToAhk(iso) {
+    if (iso = "")
+        return ""
+    if !RegExMatch(iso, "O)^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})", m)
+        return ""
+    return m1 m2 m3 m4 m5 m6
+}
+
+; =====================================================================
+; NIGHTSHARK BUILT-IN SHIMS (standalone replacement - free, no Nightshark)
+; =====================================================================
+Log(msg) {
+    global LogFile
+    FormatTime, ts, %A_Now%, yyyy-MM-dd HH:mm:ss
+    FileAppend, [%ts%] %msg%`n, %LogFile%, UTF-8
+}
+
+stopCode() {
+    Log("Bot stopped.")
+    ExitApp
+}
+
+LogStream(label, value) {
+    WriteLogStream(label, value, true)
+}
+
+LogStreamRemove(label) {
+    WriteLogStream(label, "", false)
+}
+
+WriteLogStream(label, value, keep) {
+    global gLogStreams, gLogStreamsFile
+    if (keep)
+        gLogStreams[label] := value
+    else
+        gLogStreams.Delete(label)
+    text := ""
+    for k, v in gLogStreams
+        text .= k ": " v "`n"
+    FileDelete, %gLogStreamsFile%
+    FileAppend, %text%, %gLogStreamsFile%, UTF-8
+}
+
+HttpGet(url) {
+    static httpObj
+    if !IsObject(httpObj)
+        httpObj := ComObjCreate("WinHttp.WinHttpRequest.5.1")
+    httpObj.Option(9) := 10240
+    httpObj.SetTimeouts(3000, 3000, 5000, 5000)
+    httpObj.Open("GET", url, false)
+    httpObj.SetRequestHeader("User-Agent", "Mozilla/5.0")
+    try httpObj.Send()
+    if (httpObj.Status = 200)
+        return httpObj.ResponseText
+    return ""
+}
+
+; Underlying spot price + current 15-minute open for the asset.
+; Used for the LIVE DELTA stream and the Delta entry filter.
+; Source 1: Coinbase public API. Source 2 fallback: Binance public API.
+GetKalshiPrice(asset) {
+    cbSym := asset . "-USD"
+    bnSym := asset . "USDT"
+    price := ""
+    open15m := ""
+
+    body := HttpGet("https://api.exchange.coinbase.com/products/" cbSym "/candles?granularity=900")
+    if (body != "") {
+        ; newest candle first: [time, low, high, open, close, volume]
+        if RegExMatch(body, "\[\s*(\d+(?:\.\d+)?),\s*(\d+(?:\.\d+)?),\s*(\d+(?:\.\d+)?),\s*(\d+(?:\.\d+)?),\s*(\d+(?:\.\d+)?),\s*(\d+(?:\.\d+)?)\s*\]", m)
+            open15m := m4
+    }
+
+    body := HttpGet("https://api.coinbase.com/v2/prices/" cbSym "/spot")
+    if (body != "") {
+        amt := JsonField(body, "amount")
+        if (amt != "")
+            price := amt
+    }
+
+    if (price = "" || open15m = "") {
+        body := HttpGet("https://api.binance.com/api/v3/ticker/price?symbol=" bnSym)
+        if (body != "") {
+            p := JsonField(body, "price")
+            if (p != "" && price = "")
+                price := p
+        }
+        body := HttpGet("https://api.binance.com/api/v3/klines?symbol=" bnSym "&interval=15m&limit=1")
+        if (body != "" && open15m = "") {
+            if RegExMatch(body, "\[\[\s*\d+\s*,\s*""([\d.]+)""\s*,\s*""([\d.]+)""\s*,\s*""([\d.]+)""", k)
+                open15m := k3
+        }
+    }
+
+    if (price = "" && open15m = "")
+        return ""
+    obj := {}
+    obj.price := price
+    obj.open15m := open15m
+    return obj
+}
+
+RunCMD(command, workdir := "") {
+    shell := ComObjCreate("WScript.Shell")
+    exec := shell.Exec(ComSpec . " /C " . command)
+    out := ""
+    try out := exec.StdOut.ReadAll()
+    return out
+}
